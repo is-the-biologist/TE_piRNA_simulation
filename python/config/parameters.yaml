@@ -1,0 +1,206 @@
+# TE-piRNA Arms Race Simulation Parameters
+# Configuration file for simulation parameters and exploration ranges
+
+# =============================================================================
+# POPULATION PARAMETERS
+# =============================================================================
+population:
+  N:
+    description: "Population size (number of diploid individuals)"
+    default: 500
+    type: integer
+    range: [100, 10000]
+    exploration: [100, 250, 500, 1000, 2000]
+
+# =============================================================================
+# GENOME PARAMETERS
+# =============================================================================
+genome:
+  GENOME_SIZE:
+    description: "Size of the regular genome in base pairs"
+    default: 1000000
+    type: integer
+    range: [100000, 10000000]
+    exploration: [500000, 1000000, 2000000]
+
+  PIRNA_LOCUS_SIZE:
+    description: "Size of the piRNA locus in base pairs"
+    default: 10000
+    type: integer
+    range: [1000, 100000]
+    exploration: [5000, 10000, 20000, 50000]
+
+# =============================================================================
+# TRANSPOSABLE ELEMENT PARAMETERS
+# =============================================================================
+te:
+  TE_INITIAL_COUNT:
+    description: "Number of TEs to seed in each individual at simulation start"
+    default: 1
+    type: integer
+    range: [1, 10]
+    exploration: [1, 2, 5]
+
+  TE_TRANSPOSITION_RATE:
+    description: "Base probability of transposition per TE per generation"
+    default: 0.01
+    type: float
+    range: [0.001, 0.1]
+    exploration: [0.005, 0.01, 0.02, 0.05]
+
+  TE_EXCISION_RATE:
+    description: "Probability of TE excision per generation"
+    default: 0.001
+    type: float
+    range: [0.0, 0.01]
+    exploration: [0.0, 0.0005, 0.001, 0.002]
+
+  TE_MUTATION_RATE:
+    description: "Expected number of mutations per transposition event (Poisson mean)"
+    default: 0.5
+    type: float
+    range: [0.1, 2.0]
+    exploration: [0.1, 0.25, 0.5, 1.0, 2.0]
+
+  TE_FITNESS_EFFECT:
+    description: "Fitness cost per TE insertion (negative value, additive)"
+    default: -0.001
+    type: float
+    range: [-0.01, 0.0]
+    exploration: [-0.005, -0.002, -0.001, -0.0005, 0.0]
+
+# =============================================================================
+# piRNA SILENCING PARAMETERS
+# =============================================================================
+pirna:
+  PIRNA_STRENGTH:
+    description: "Maximum silencing effect (0 = no silencing, 1 = complete silencing)"
+    default: 0.9
+    type: float
+    range: [0.0, 1.0]
+    exploration: [0.5, 0.7, 0.9, 0.95, 0.99]
+
+  PIRNA_SPECIFICITY:
+    description: "Decay constant for silencing (higher = broader silencing, lower = more specific)"
+    default: 5.0
+    type: float
+    range: [1.0, 20.0]
+    exploration: [1.0, 2.0, 5.0, 10.0, 20.0]
+
+# =============================================================================
+# SIMULATION PARAMETERS
+# =============================================================================
+simulation:
+  SIM_GENERATIONS:
+    description: "Total number of generations to simulate"
+    default: 5000
+    type: integer
+    range: [1000, 50000]
+    exploration: [2000, 5000, 10000]
+
+  OUTPUT_INTERVAL:
+    description: "Write detailed output every N generations"
+    default: 100
+    type: integer
+    range: [10, 500]
+
+  OUTPUT_DIR:
+    description: "Directory for output files"
+    default: "output/"
+    type: string
+
+# =============================================================================
+# PARAMETER EXPLORATION SETTINGS
+# =============================================================================
+exploration:
+  # Parameters to explore in systematic sweeps
+  priority_parameters:
+    - PIRNA_SPECIFICITY
+    - TE_MUTATION_RATE
+    - PIRNA_STRENGTH
+    - TE_TRANSPOSITION_RATE
+
+  # Parameters expected to be most important for arms race dynamics
+  arms_race_critical:
+    - PIRNA_SPECIFICITY
+    - TE_MUTATION_RATE
+
+  # Parameters affecting TE competition
+  competition_critical:
+    - TE_FITNESS_EFFECT
+    - TE_TRANSPOSITION_RATE
+    - TE_EXCISION_RATE
+
+  # Latin Hypercube Sampling settings
+  lhs:
+    n_samples: 100
+    seed: 42
+
+  # Grid search settings
+  grid:
+    # For focused 2D sweeps
+    param_pairs:
+      - [PIRNA_SPECIFICITY, TE_MUTATION_RATE]
+      - [PIRNA_STRENGTH, PIRNA_SPECIFICITY]
+      - [TE_FITNESS_EFFECT, TE_TRANSPOSITION_RATE]
+
+# =============================================================================
+# OUTPUT CONFIGURATION
+# =============================================================================
+output:
+  files:
+    genealogy: "te_genealogy.tsv"
+    transposition: "transposition_events.tsv"
+    census: "te_census.tsv"
+    summary: "population_summary.tsv"
+
+  # Columns in each output file
+  genealogy_columns:
+    - parent_id
+    - child_id
+    - generation
+    - divergence
+    - lineage_id
+
+  transposition_columns:
+    - generation
+    - te_id
+    - source_position
+    - target_position
+    - was_silenced
+    - effective_rate
+
+  census_columns:
+    - generation
+    - individual_id
+    - te_id
+    - position
+    - divergence
+    - is_in_pirna_locus
+    - lineage_id
+
+  summary_columns:
+    - generation
+    - mean_te_count
+    - total_transpositions
+    - mean_fitness
+    - active_lineages
+    - pirna_te_count
+
+# =============================================================================
+# MIGRATION MODEL PARAMETERS (for two-population extension)
+# =============================================================================
+migration:
+  enabled: false
+  migration_rate:
+    description: "Proportion of individuals migrating per generation"
+    default: 0.0
+    type: float
+    range: [0.0, 0.1]
+    exploration: [0.0, 0.001, 0.01, 0.05]
+
+  isolation_period:
+    description: "Generations of isolation before migration resumes"
+    default: 1000
+    type: integer
+    range: [0, 5000]

@@ -1,0 +1,438 @@
+// TE-piRNA Arms Race Simulation
+// Forward genetic simulation of transposable element evolution with piRNA silencing
+//
+// This simulation models:
+// 1. TE transposition and excision
+// 2. TE sequence divergence (simplified integer model)
+// 3. piRNA-mediated silencing based on sequence similarity
+// 4. Fitness effects of TE insertions
+//
+// Updated for SLiM 4.x compatibility
+
+initialize() {
+    // Tree-sequence recording for genealogy tracking
+    initializeTreeSeq();
+    // ===========================================
+    // SIMULATION PARAMETERS (can be overridden via command line with -d)
+    // ===========================================
+
+    // Population parameters
+    if (!exists("N")) defineConstant("N", 500);                    // Population size
+
+    // Genome parameters
+    if (!exists("GENOME_SIZE")) defineConstant("GENOME_SIZE", asInteger(1e6));      // Regular genome size
+    if (!exists("PIRNA_LOCUS_SIZE")) defineConstant("PIRNA_LOCUS_SIZE", asInteger(1e4)); // piRNA locus size
+    if (!exists("PIRNA_LOCUS_START")) defineConstant("PIRNA_LOCUS_START", GENOME_SIZE);   // Start of piRNA locus
+
+    // TE parameters
+    if (!exists("TE_INITIAL_COUNT")) defineConstant("TE_INITIAL_COUNT", 1);       // Starting TEs per individual
+    if (!exists("TE_TRANSPOSITION_RATE")) defineConstant("TE_TRANSPOSITION_RATE", 0.01); // Base transposition rate
+    if (!exists("TE_EXCISION_RATE")) defineConstant("TE_EXCISION_RATE", 0.001);   // Excision probability
+    if (!exists("TE_MUTATION_RATE")) defineConstant("TE_MUTATION_RATE", 0.5);     // Mutations per transposition
+    if (!exists("TE_FITNESS_EFFECT")) defineConstant("TE_FITNESS_EFFECT", -0.001); // Fitness cost per TE
+
+    // piRNA silencing parameters
+    if (!exists("PIRNA_STRENGTH")) defineConstant("PIRNA_STRENGTH", 0.9);       // Max silencing (0-1)
+    if (!exists("PIRNA_SPECIFICITY")) defineConstant("PIRNA_SPECIFICITY", 5.0);    // Decay half-life (mutations)
+
+    // Simulation parameters
+    if (!exists("SIM_GENERATIONS")) defineConstant("SIM_GENERATIONS", 5000);     // Total generations
+    if (!exists("OUTPUT_INTERVAL")) defineConstant("OUTPUT_INTERVAL", 100);      // Output every N generations
+    if (!exists("OUTPUT_DIR")) defineConstant("OUTPUT_DIR", "output/");     // Output directory
+
+    // ===========================================
+    // INITIALIZE MUTATION TYPES
+    // ===========================================
+
+    // m1: Neutral mutations (background, not used much)
+    initializeMutationType("m1", 0.5, "f", 0.0);
+
+    // m2: TE insertions - these are our transposable elements
+    // Selection coefficient will be calculated dynamically based on total TE count
+    initializeMutationType("m2", 0.5, "f", 0.0);
+    m2.convertToSubstitution = F;  // TEs should not fix as substitutions
+    m2.mutationStackPolicy = "l";  // Last mutation at a position wins (allows TE replacement)
+
+    // ===========================================
+    // INITIALIZE GENOMIC ELEMENTS
+    // ===========================================
+
+    // g1: Regular genome (where TEs affect fitness)
+    initializeGenomicElementType("g1", m1, 1.0);
+
+    // g2: piRNA locus (non-recombining, TEs here become silencers)
+    initializeGenomicElementType("g2", m1, 1.0);
+
+    // Define chromosome structure
+    initializeGenomicElement(g1, 0, GENOME_SIZE - 1);
+    initializeGenomicElement(g2, PIRNA_LOCUS_START, PIRNA_LOCUS_START + PIRNA_LOCUS_SIZE - 1);
+
+    // ===========================================
+    // RECOMBINATION
+    // ===========================================
+
+    // Set up recombination: normal in genome, zero in piRNA locus
+    // Recombination rate of 1e-8 in regular genome, 0 in piRNA locus
+    ends = c(GENOME_SIZE - 1, PIRNA_LOCUS_START + PIRNA_LOCUS_SIZE - 1);
+    rates = c(1e-8, 0.0);
+    initializeRecombinationRate(rates, ends);
+
+    // No background mutations (we handle TE mutations manually)
+    initializeMutationRate(0.0);
+
+    // ===========================================
+    // OUTPUT FILE SETUP
+    // ===========================================
+
+    // Initialize output files with headers
+    defineConstant("GENEALOGY_FILE", OUTPUT_DIR + "te_genealogy.tsv");
+    defineConstant("TRANSPOSITION_FILE", OUTPUT_DIR + "transposition_events.tsv");
+    defineConstant("CENSUS_FILE", OUTPUT_DIR + "te_census.tsv");
+    defineConstant("SUMMARY_FILE", OUTPUT_DIR + "population_summary.tsv");
+}
+
+// ===========================================
+// HELPER FUNCTIONS
+// ===========================================
+
+// Generate a unique TE ID
+function (integer)getNextTEID(void) {
+    id = TE_ID_COUNTER;
+    defineGlobal("TE_ID_COUNTER", id + 1);
+    return id;
+}
+
+// Check if a position is in the piRNA locus
+function (logical)isInPirnaLocus(integer pos) {
+    return (pos >= PIRNA_LOCUS_START);
+}
+
+// Calculate silencing effect based on divergence
+// Returns value between 0 (no silencing) and PIRNA_STRENGTH (max silencing)
+function (float)calculateSilencing(integer divergence) {
+    return PIRNA_STRENGTH * exp(-divergence / PIRNA_SPECIFICITY);
+}
+
+// Get divergence between two TEs based on their stored divergence values
+// In the simplified model, we use the absolute difference of divergence values
+// This assumes TEs with similar divergence values are more closely related
+function (integer)getTEDivergence(* te1, * te2) {
+    div1 = asInteger(te1.getValue("divergence"));
+    div2 = asInteger(te2.getValue("divergence"));
+    lineage1 = asInteger(te1.getValue("lineage_id"));
+    lineage2 = asInteger(te2.getValue("lineage_id"));
+
+    // If same lineage, divergence is the difference
+    if (lineage1 == lineage2) {
+        return abs(div1 - div2);
+    }
+    // Different lineages: sum of divergences (they diverged from common ancestor)
+    return div1 + div2;
+}
+
+// Calculate effective transposition rate for a TE given piRNA silencing
+function (float)getEffectiveTranspositionRate(* te, * ind) {
+    base_rate = TE_TRANSPOSITION_RATE;
+
+    // Get all TEs from both genomes using vectorized operations
+    all_muts = c(ind.haplosomes[0].mutations, ind.haplosomes[1].mutations);
+
+    // Filter to m2 type mutations in piRNA locus
+    te_muts = all_muts[all_muts.mutationType == m2];
+    if (size(te_muts) == 0) {
+        return base_rate;
+    }
+
+    // Get positions and filter to piRNA locus
+    positions = te_muts.position;
+    in_pirna = positions >= PIRNA_LOCUS_START;
+    pirna_tes = te_muts[in_pirna];
+
+    // If no piRNAs, no silencing
+    if (size(pirna_tes) == 0) {
+        return base_rate;
+    }
+
+    // Get divergence of the source TE
+    te_div = asInteger(te.getValue("divergence"));
+    te_lineage = asInteger(te.getValue("lineage_id"));
+
+    // Calculate silencing from the closest piRNA (simplification for performance)
+    // Use minimum divergence among all piRNA TEs for max silencing
+    min_divergence = 1000;  // Large initial value
+    for (pirna_te in pirna_tes) {
+        pirna_div = asInteger(pirna_te.getValue("divergence"));
+        pirna_lineage = asInteger(pirna_te.getValue("lineage_id"));
+
+        // Calculate divergence
+        if (te_lineage == pirna_lineage) {
+            div = abs(te_div - pirna_div);
+        } else {
+            div = te_div + pirna_div;
+        }
+
+        if (div < min_divergence) {
+            min_divergence = div;
+        }
+    }
+
+    // Calculate silencing from minimum divergence
+    silencing = PIRNA_STRENGTH * exp(-min_divergence / PIRNA_SPECIFICITY);
+    effective_rate = base_rate * (1.0 - silencing);
+    return effective_rate;
+}
+
+// Create a new TE mutation with metadata
+function (*)createTE(* genome, integer position, integer parent_id, integer divergence, integer lineage_id, integer generation) {
+    te_id = getNextTEID();
+
+    // Add the TE as a mutation
+    mut = genome.addNewDrawnMutation(m2, position);
+
+    // Store TE metadata
+    mut.setValue("te_id", te_id);
+    mut.setValue("parent_id", parent_id);
+    mut.setValue("divergence", divergence);
+    mut.setValue("lineage_id", lineage_id);
+    mut.setValue("generation_born", generation);
+
+    return mut;
+}
+
+// Log a transposition event
+function (void)logTransposition(integer generation, integer te_id, integer source_pos, integer target_pos, float effective_rate, logical was_silenced) {
+    line = paste(c(generation, te_id, source_pos, target_pos,
+                   ifelse(was_silenced, "TRUE", "FALSE"),
+                   format("%.6f", effective_rate)), sep="\t");
+    writeFile(TRANSPOSITION_FILE, line, append=T);
+}
+
+// Log TE genealogy
+function (void)logGenealogy(integer parent_id, integer child_id, integer generation, integer divergence, integer lineage_id) {
+    line = paste(c(parent_id, child_id, generation, divergence, lineage_id), sep="\t");
+    writeFile(GENEALOGY_FILE, line, append=T);
+}
+
+// ===========================================
+// SIMULATION EVENTS
+// ===========================================
+
+1 early() {
+    // Initialize global tracking variables using defineGlobal() for SLiM 4.x
+    defineGlobal("TE_ID_COUNTER", 0);           // Unique ID for each TE
+    defineGlobal("TOTAL_TRANSPOSITIONS", 0);    // Count transpositions per generation
+    defineGlobal("GENERATION_TRANSPOSITIONS", 0);
+
+    // Write output file headers
+    writeFile(GENEALOGY_FILE, "parent_id\tchild_id\tgeneration\tdivergence\tlineage_id");
+    writeFile(TRANSPOSITION_FILE, "generation\tte_id\tsource_position\ttarget_position\twas_silenced\teffective_rate");
+    writeFile(CENSUS_FILE, "generation\tindividual_id\tte_id\tposition\tdivergence\tis_in_pirna_locus\tlineage_id");
+    writeFile(SUMMARY_FILE, "generation\tmean_te_count\ttotal_transpositions\tmean_fitness\tactive_lineages\tpirna_te_count");
+
+    // Create the population
+    sim.addSubpop("p1", N);
+
+    // Seed initial TEs in each individual
+    inds = p1.individuals;
+    for (ind in inds) {
+        for (i in seqLen(TE_INITIAL_COUNT)) {
+            // Random position in regular genome (not piRNA locus)
+            pos = rdunif(1, 0, GENOME_SIZE - 1);
+
+            // Choose random genome (0 or 1)
+            genome = ifelse(runif(1) < 0.5, ind.haplosomes[0], ind.haplosomes[1]);
+
+            // Create initial TE (divergence=0, lineage=te_id, parent=-1)
+            te_id = getNextTEID();
+            mut = genome.addNewDrawnMutation(m2, pos);
+            mut.setValue("te_id", te_id);
+            mut.setValue("parent_id", -1);  // No parent (original)
+            mut.setValue("divergence", 0);
+            mut.setValue("lineage_id", te_id);  // Each initial TE starts its own lineage
+            mut.setValue("generation_born", 1);
+
+            // Log genealogy for initial TE
+            logGenealogy(-1, te_id, 1, 0, te_id);
+        }
+    }
+
+    catn("Simulation initialized with " + N + " individuals");
+    catn("Initial TEs per individual: " + TE_INITIAL_COUNT);
+}
+
+// ===========================================
+// TE DYNAMICS: TRANSPOSITION AND EXCISION
+// ===========================================
+
+2:100000 early() {
+    // Reset generation transposition counter (runs from gen 2 onwards)
+    defineGlobal("GENERATION_TRANSPOSITIONS", 0);
+
+    gen = community.tick;
+    inds = p1.individuals;
+
+    for (ind in inds) {
+        // Collect all TEs from both genomes using vectorized operations
+        all_muts = c(ind.haplosomes[0].mutations, ind.haplosomes[1].mutations);
+        all_tes = all_muts[all_muts.mutationType == m2];
+        genomes = c(ind.haplosomes[0], ind.haplosomes[1]);
+
+        // Process each TE for potential transposition
+        for (te in all_tes) {
+            // Calculate effective transposition rate with piRNA silencing
+            eff_rate = getEffectiveTranspositionRate(te, ind);
+            was_silenced = (eff_rate < TE_TRANSPOSITION_RATE);
+
+            // Attempt transposition
+            if (runif(1) < eff_rate) {
+                // Choose target position (can be anywhere in genome including piRNA locus)
+                total_size = GENOME_SIZE + PIRNA_LOCUS_SIZE;
+                target_pos = rdunif(1, 0, total_size - 1);
+
+                // Choose target genome randomly
+                target_genome = ifelse(runif(1) < 0.5, ind.haplosomes[0], ind.haplosomes[1]);
+
+                // Calculate new divergence (parent divergence + new mutations)
+                parent_div = asInteger(te.getValue("divergence"));
+                new_mutations = rpois(1, TE_MUTATION_RATE);
+                new_div = parent_div + new_mutations;
+
+                // Get parent info
+                parent_id = asInteger(te.getValue("te_id"));
+                lineage_id = asInteger(te.getValue("lineage_id"));
+                source_pos = te.position;
+
+                // Create new TE
+                new_te = createTE(target_genome, target_pos, parent_id, new_div, lineage_id, gen);
+                new_te_id = asInteger(new_te.getValue("te_id"));
+
+                // Log the transposition
+                logTransposition(gen, new_te_id, source_pos, target_pos, eff_rate, was_silenced);
+                logGenealogy(parent_id, new_te_id, gen, new_div, lineage_id);
+
+                // Increment counter
+                defineGlobal("GENERATION_TRANSPOSITIONS", GENERATION_TRANSPOSITIONS + 1);
+            }
+        }
+
+        // Process excision for each TE (vectorized)
+        for (genome in genomes) {
+            te_muts = genome.mutations;
+            te_muts = te_muts[te_muts.mutationType == m2];
+            if (size(te_muts) > 0) {
+                // Generate excision probabilities for all TEs at once
+                excise = runif(size(te_muts)) < TE_EXCISION_RATE;
+                tes_to_remove = te_muts[excise];
+                if (size(tes_to_remove) > 0) {
+                    genome.removeMutations(tes_to_remove);
+                }
+            }
+        }
+    }
+
+    // Update total
+    defineGlobal("TOTAL_TRANSPOSITIONS", TOTAL_TRANSPOSITIONS + GENERATION_TRANSPOSITIONS);
+}
+
+// ===========================================
+// FITNESS CALCULATION
+// ===========================================
+
+// Each TE insertion has a weakly deleterious fitness effect
+// TEs in piRNA locus are neutral (they serve as silencers)
+mutationEffect(m2) {
+    if (mut.position >= PIRNA_LOCUS_START)
+        return 1.0;
+    return 1.0 + TE_FITNESS_EFFECT;
+}
+
+// ===========================================
+// OUTPUT AND MONITORING
+// ===========================================
+
+1:100000 late() {
+    gen = community.tick;
+
+    // Output every OUTPUT_INTERVAL generations
+    if (gen % OUTPUT_INTERVAL == 0 | gen == 1) {
+        inds = p1.individuals;
+
+        // Calculate statistics
+        te_counts = c();
+        fitnesses = c();
+        lineages = c();
+        pirna_count = 0;
+
+        for (ind in inds) {
+            ind_te_count = 0;
+            genomes = c(ind.haplosomes[0], ind.haplosomes[1]);
+
+            for (genome in genomes) {
+                muts = genome.mutations;
+                for (mut in muts) {
+                    if (mut.mutationType == m2) {
+                        ind_te_count = ind_te_count + 1;
+                        lineages = c(lineages, asInteger(mut.getValue("lineage_id")));
+
+                        if (isInPirnaLocus(mut.position)) {
+                            pirna_count = pirna_count + 1;
+                        }
+
+                        // Write to census file
+                        te_id = asInteger(mut.getValue("te_id"));
+                        div = asInteger(mut.getValue("divergence"));
+                        in_pirna = isInPirnaLocus(mut.position);
+                        lineage = asInteger(mut.getValue("lineage_id"));
+
+                        line = paste(c(gen, ind.index, te_id, mut.position, div,
+                                      ifelse(in_pirna, "TRUE", "FALSE"), lineage), sep="\t");
+                        writeFile(CENSUS_FILE, line, append=T);
+                    }
+                }
+            }
+
+            te_counts = c(te_counts, ind_te_count);
+            fitnesses = c(fitnesses, ind.fitnessScaling);
+        }
+
+        // Calculate summary statistics
+        mean_te = mean(te_counts);
+        mean_fit = mean(fitnesses);
+        active_lineages = size(unique(lineages));
+
+        // Write summary
+        gen_trans = GENERATION_TRANSPOSITIONS;
+        line = paste(c(gen, format("%.2f", mean_te), gen_trans,
+                      format("%.4f", mean_fit), active_lineages, pirna_count), sep="\t");
+        writeFile(SUMMARY_FILE, line, append=T);
+
+        // Console output
+        catn("Gen " + gen + ": mean TEs=" + format("%.1f", mean_te) +
+             ", transpositions=" + gen_trans +
+             ", lineages=" + active_lineages +
+             ", piRNA TEs=" + pirna_count);
+    }
+
+    // Check for simulation end
+    if (gen >= SIM_GENERATIONS) {
+        catn("\n=== Simulation Complete ===");
+        catn("Total cycles: " + gen);
+        catn("Total transpositions: " + TOTAL_TRANSPOSITIONS);
+
+        // Output tree-sequence file for genealogy analysis
+        sim.treeSeqOutput(OUTPUT_DIR + "tree_sequence.trees");
+
+        // Count final TEs
+        total_tes = 0;
+        for (ind in inds) {
+            for (genome in c(ind.haplosomes[0], ind.haplosomes[1])) {
+                te_muts = genome.mutations[genome.mutations.mutationType == m2];
+                total_tes = total_tes + size(te_muts);
+            }
+        }
+        catn("Final total TEs in population: " + total_tes);
+        catn("Output written to: " + OUTPUT_DIR);
+
+        community.simulationFinished();
+    }
+}
