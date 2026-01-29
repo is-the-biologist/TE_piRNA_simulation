@@ -16,8 +16,8 @@ set -euo pipefail
 
 # Find SLiM executable
 SLIM_BIN=""
-for candidate in slim ~/bin/slim /usr/local/bin/slim /opt/homebrew/bin/slim; do
-    if command -v "$candidate" &>/dev/null; then
+for candidate in "$HOME/bin/slim" /opt/homebrew/bin/slim /usr/local/bin/slim slim; do
+    if command -v "$candidate" &>/dev/null || [ -x "$candidate" ]; then
         SLIM_BIN="$candidate"
         break
     fi
